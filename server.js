@@ -15,23 +15,28 @@ app.use(
     })
 );
 
-// 1. REVERSE PROXY: Routes all /api/v1 calls directly to Newton School
-// Placed BEFORE express.json() so body streaming isn't interrupted
+// 1. REVERSE PROXY: Placed before express.json() with pathFilter to prevent Express path-stripping
 app.use(
-    '/api/v1',
     createProxyMiddleware({
         target: 'https://my.newtonschool.co',
         changeOrigin: true,
         secure: true,
+        pathFilter: '/api/v1/**',
         on: {
-            proxyReq: (proxyReq) => {
+            proxyReq: (proxyReq, req) => {
                 proxyReq.removeHeader('origin');
                 proxyReq.removeHeader('referer');
+                console.log(`[Proxy Outgoing] ${req.method} ${req.originalUrl}`);
+            },
+            proxyRes: (proxyRes, req) => {
+                console.log(`[Proxy Response] ${req.method} ${req.originalUrl} -> ${proxyRes.statusCode}`);
+            },
+            error: (err, req, res) => {
+                console.error(`[Proxy Error] ${req.originalUrl}:`, err.message);
             },
         },
     })
 );
-
 app.use(express.json());
 
 let browser;
