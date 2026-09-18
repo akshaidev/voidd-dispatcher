@@ -11,11 +11,15 @@ app.use(express.json());
 
 let browser;
 
-// Initialize shared Chromium instance
 async function initBrowser() {
     browser = await chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+        ],
     });
     console.log('Chromium instance launched');
 }
@@ -39,26 +43,49 @@ app.post('/api/send-otp', async (req, res) => {
     try {
         if (!browser) await initBrowser();
 
-        // Isolated context per request
         context = await browser.newContext({
             userAgent:
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 800 },
+        });
+
+        // Strip automation flags so WAFs don't block the request
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
 
         const page = await context.newPage();
 
-        // 1. Visit Newton login page to sit inside genuine domain origin
+        console.log(`[${digits}] Navigating to Newton School login...`);
         await page.goto('https://my.newtonschool.co/login', {
             waitUntil: 'domcontentloaded',
-            timeout: 15000,
+            timeout: 20000,
         });
 
-        // 2. Wait for Google reCAPTCHA v3 runtime to mount
-        await page.waitForFunction(() => typeof window.grecaptcha?.execute === 'function', {
-            timeout: 10000,
-        });
+        const pageTitle = await page.title();
+        console.log(`[${digits}] Page loaded. Title: "${pageTitle}" | URL: ${page.url()}`);
 
-        // 3. Execute reCAPTCHA inside genuine domain context and dispatch OTP
+        // Actively inject Google reCAPTCHA into the page rather than waiting for Newton
+        console.log(`[${digits}] Injecting Google reCAPTCHA script...`);
+        await page.evaluate((siteKey) => {
+            return new Promise((resolve) => {
+                if (window.grecaptcha?.execute) return resolve();
+                const script = document.createElement('script');
+                script.id = 'recaptcha-injected';
+                script.src = `https://www.google.com/recaptcha/api.js?render=${siteKey}`;
+                script.onload = () => resolve();
+                document.head.appendChild(script);
+            });
+        }, RECAPTCHA_SITE_KEY);
+
+        // Wait for execution readiness (usually ready in <1 sec)
+        await page.waitForFunction(
+            () => typeof window.grecaptcha?.execute === 'function',
+            null,
+            { timeout: 10000 }
+        );
+
+        console.log(`[${digits}] Executing reCAPTCHA and dispatching OTP via internal fetch...`);
         const result = await page.evaluate(
             async ({ siteKey, phone }) => {
                 return new Promise((resolve) => {
@@ -94,22 +121,26 @@ app.post('/api/send-otp', async (req, res) => {
         );
 
         await context.close();
+        console.log(`[${digits}] Result:`, result);
 
         if (!result.ok) {
             return res.status(result.status || 400).json({
-                error: result.data?.message || result.data?.detail || 'Failed to dispatch OTP from portal',
+                error:
+                    result.data?.message ||
+                    result.data?.detail ||
+                    result.error ||
+                    'Failed to dispatch OTP from portal',
             });
         }
 
         return res.json({ success: true, message: 'OTP sent successfully' });
     } catch (err) {
         if (context) await context.close().catch(() => { });
-        console.error('Dispatcher error:', err);
+        console.error(`[${digits}] Error:`, err.message);
         return res.status(500).json({ error: err.message || 'Internal dispatcher error' });
     }
 });
 
-// Graceful termination
 process.on('SIGTERM', async () => {
     if (browser) await browser.close();
     process.exit(0);
