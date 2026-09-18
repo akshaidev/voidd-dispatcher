@@ -7,7 +7,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const RECAPTCHA_SITE_KEY = '6Lf_NBgaAAAAAJyDanAyvywRHcAuAbedr5slkECB';
 
-// CORS setup for web / PWA requests
 app.use(
     cors({
         origin: (origin, callback) => callback(null, true),
@@ -15,13 +14,13 @@ app.use(
     })
 );
 
-// 1. REVERSE PROXY: Placed before express.json() with pathFilter to prevent Express path-stripping
+// 1. REVERSE PROXY: Catches ALL /api calls (v1, v2, etc.) EXCEPT our local /api/send-otp
 app.use(
     createProxyMiddleware({
         target: 'https://my.newtonschool.co',
         changeOrigin: true,
         secure: true,
-        pathFilter: '/api/v1/**',
+        pathFilter: (pathname) => pathname.startsWith('/api') && pathname !== '/api/send-otp',
         on: {
             proxyReq: (proxyReq, req) => {
                 proxyReq.removeHeader('origin');
@@ -31,13 +30,12 @@ app.use(
             proxyRes: (proxyRes, req) => {
                 console.log(`[Proxy Response] ${req.method} ${req.originalUrl} -> ${proxyRes.statusCode}`);
             },
-            error: (err, req, res) => {
+            error: (err, req) => {
                 console.error(`[Proxy Error] ${req.originalUrl}:`, err.message);
             },
         },
     })
 );
-app.use(express.json());
 
 let browser;
 let warmPage = null;
@@ -56,7 +54,7 @@ async function initBrowser() {
             '--disable-gpu',
         ],
     });
-    console.log('Chromium initialized');
+    console.log('Chromium ready');
     await prepareWarmPage();
 }
 
@@ -111,9 +109,7 @@ async function prepareWarmPage() {
         );
 
         warmPage = page;
-        console.log('⚡ Standby page pre-warmed');
-    } catch (err) {
-        console.error('Warming error:', err.message);
+    } catch {
         warmPage = null;
     } finally {
         isWarming = false;
@@ -124,8 +120,8 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', warm: Boolean(warmPage) });
 });
 
-// 2. OTP DISPATCHER: Solves reCAPTCHA v3 on Newton domain and triggers SMS
-app.post('/api/send-otp', (req, res) => {
+// 2. OTP DISPATCHER: Apply express.json() specifically to this endpoint
+app.post('/api/send-otp', express.json(), (req, res) => {
     const rawPhone = req.body?.phone;
     if (!rawPhone) return res.status(400).json({ error: 'Phone is required' });
 
@@ -173,7 +169,7 @@ app.post('/api/send-otp', (req, res) => {
 
             if (!result.ok) {
                 return res.status(result.status || 400).json({
-                    error: result.data?.message || result.data?.detail || 'Portal rejected OTP request',
+                    error: result.data?.message || result.data?.detail || 'Portal rejected OTP',
                 });
             }
 
@@ -187,7 +183,7 @@ app.post('/api/send-otp', (req, res) => {
 
 initBrowser()
     .then(() => {
-        app.listen(PORT, () => console.log(`Backend live on port ${PORT}`));
+        app.listen(PORT, () => console.log(`Consolidated backend live on port ${PORT}`));
     })
     .catch((err) => {
         console.error('Boot error:', err);
