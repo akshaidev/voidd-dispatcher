@@ -1,19 +1,44 @@
 import express from 'express';
 import cors from 'cors';
 import { chromium } from 'playwright';
+import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const RECAPTCHA_SITE_KEY = '6Lf_NBgaAAAAAJyDanAyvywRHcAuAbedr5slkECB';
 
-app.use(cors({ origin: '*' }));
+// CORS setup for web / PWA requests
+app.use(
+    cors({
+        origin: (origin, callback) => callback(null, true),
+        credentials: true,
+    })
+);
+
+// 1. REVERSE PROXY: Routes all /api/v1 calls directly to Newton School
+// Placed BEFORE express.json() so body streaming isn't interrupted
+app.use(
+    '/api/v1',
+    createProxyMiddleware({
+        target: 'https://my.newtonschool.co',
+        changeOrigin: true,
+        secure: true,
+        on: {
+            proxyReq: (proxyReq) => {
+                proxyReq.removeHeader('origin');
+                proxyReq.removeHeader('referer');
+            },
+        },
+    })
+);
+
 app.use(express.json());
 
 let browser;
 let warmPage = null;
 let isWarming = false;
+let otpQueue = Promise.resolve();
 
-// Launch browser with hardware acceleration flags disabled for speed
 async function initBrowser() {
     browser = await chromium.launch({
         headless: true,
@@ -26,11 +51,10 @@ async function initBrowser() {
             '--disable-gpu',
         ],
     });
-    console.log('Chromium ready');
+    console.log('Chromium initialized');
     await prepareWarmPage();
 }
 
-// Pre-load a page so it is sitting ready in memory before any request arrives
 async function prepareWarmPage() {
     if (isWarming || !browser) return;
     isWarming = true;
@@ -47,15 +71,13 @@ async function prepareWarmPage() {
 
         const page = await context.newPage();
 
-        // Block images, styles, fonts, and analytics to make loads near-instant
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
             const url = route.request().url();
             if (
                 ['image', 'stylesheet', 'font', 'media'].includes(type) ||
                 url.includes('google-analytics') ||
-                url.includes('mixpanel') ||
-                url.includes('segment')
+                url.includes('mixpanel')
             ) {
                 return route.abort();
             }
@@ -67,7 +89,6 @@ async function prepareWarmPage() {
             timeout: 15000,
         });
 
-        // Pre-inject reCAPTCHA so it is ready for immediate execution
         await page.evaluate((siteKey) => {
             return new Promise((resolve) => {
                 if (window.grecaptcha?.execute) return resolve();
@@ -85,9 +106,9 @@ async function prepareWarmPage() {
         );
 
         warmPage = page;
-        console.log('⚡ Standby page warm and ready for instant dispatch');
+        console.log('⚡ Standby page pre-warmed');
     } catch (err) {
-        console.error('Failed to warm page:', err.message);
+        console.error('Warming error:', err.message);
         warmPage = null;
     } finally {
         isWarming = false;
@@ -98,83 +119,72 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', warm: Boolean(warmPage) });
 });
 
-app.post('/api/send-otp', async (req, res) => {
+// 2. OTP DISPATCHER: Solves reCAPTCHA v3 on Newton domain and triggers SMS
+app.post('/api/send-otp', (req, res) => {
     const rawPhone = req.body?.phone;
     if (!rawPhone) return res.status(400).json({ error: 'Phone is required' });
 
     const digits = String(rawPhone).replace(/\D/g, '').slice(-10);
     if (digits.length !== 10) return res.status(400).json({ error: 'Invalid 10-digit number' });
 
-    const startTime = Date.now();
+    otpQueue = otpQueue
+        .then(async () => {
+            if (!warmPage) await prepareWarmPage();
 
-    try {
-        // If a warm page is ready, use it instantly. Otherwise, wait for one.
-        if (!warmPage) {
-            console.log('No warm page available, spinning up immediately...');
-            await prepareWarmPage();
-        }
+            const page = warmPage;
+            warmPage = null;
+            setTimeout(() => prepareWarmPage(), 100);
 
-        const page = warmPage;
-        warmPage = null; // Take ownership so next request doesn't clash
+            const result = await page.evaluate(
+                async ({ siteKey, phone }) => {
+                    return new Promise((resolve) => {
+                        window.grecaptcha.ready(async () => {
+                            try {
+                                const token = await window.grecaptcha.execute(siteKey, { action: 'login' });
+                                const response = await fetch('/api/v1/user/otp/', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        Accept: 'application/json, text/plain, */*',
+                                    },
+                                    body: JSON.stringify({
+                                        phone: `+91${phone}`,
+                                        'g-recaptcha-response': token,
+                                    }),
+                                });
 
-        // Trigger pre-warming for the next request in the background
-        setTimeout(() => prepareWarmPage(), 100);
-
-        // Execute directly in the pre-warmed DOM
-        const result = await page.evaluate(
-            async ({ siteKey, phone }) => {
-                return new Promise((resolve) => {
-                    window.grecaptcha.ready(async () => {
-                        try {
-                            const token = await window.grecaptcha.execute(siteKey, { action: 'login' });
-
-                            const response = await fetch('/api/v1/user/otp/', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    Accept: 'application/json, text/plain, */*',
-                                },
-                                body: JSON.stringify({
-                                    phone: `+91${phone}`,
-                                    'g-recaptcha-response': token,
-                                }),
-                            });
-
-                            const payload = await response.json().catch(() => ({}));
-                            resolve({ ok: response.ok, status: response.status, data: payload });
-                        } catch (err) {
-                            resolve({ ok: false, status: 500, error: err.message });
-                        }
+                                const payload = await response.json().catch(() => ({}));
+                                resolve({ ok: response.ok, status: response.status, data: payload });
+                            } catch (err) {
+                                resolve({ ok: false, status: 500, error: err.message });
+                            }
+                        });
                     });
+                },
+                { siteKey: RECAPTCHA_SITE_KEY, phone: digits }
+            );
+
+            page.context().close().catch(() => { });
+
+            if (!result.ok) {
+                return res.status(result.status || 400).json({
+                    error: result.data?.message || result.data?.detail || 'Portal rejected OTP request',
                 });
-            },
-            { siteKey: RECAPTCHA_SITE_KEY, phone: digits }
-        );
+            }
 
-        // Close used context asynchronously
-        page.context().close().catch(() => { });
-
-        console.log(`[${digits}] Dispatched in ${Date.now() - startTime}ms`);
-
-        if (!result.ok) {
-            return res.status(result.status || 400).json({
-                error: result.data?.message || result.data?.detail || 'Portal rejected OTP request',
-            });
-        }
-
-        return res.json({ success: true, message: 'OTP sent successfully' });
-    } catch (err) {
-        console.error('Dispatch failed:', err);
-        prepareWarmPage().catch(() => { });
-        return res.status(500).json({ error: err.message || 'Internal dispatcher error' });
-    }
+            res.json({ success: true, message: 'OTP sent successfully' });
+        })
+        .catch((err) => {
+            prepareWarmPage().catch(() => { });
+            res.status(500).json({ error: err.message || 'Dispatcher failure' });
+        });
 });
 
 initBrowser()
     .then(() => {
-        app.listen(PORT, () => console.log(`Dispatcher listening on port ${PORT}`));
+        app.listen(PORT, () => console.log(`Backend live on port ${PORT}`));
     })
     .catch((err) => {
-        console.error('Failed to start:', err);
+        console.error('Boot error:', err);
         process.exit(1);
     });
