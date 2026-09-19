@@ -7,9 +7,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const RECAPTCHA_SITE_KEY = '6Lf_NBgaAAAAAJyDanAyvywRHcAuAbedr5slkECB';
 
+const allowedOrigins = [
+    'http://localhost:5173',
+    'https://getvoidd.site',
+];
+
 app.use(
     cors({
-        origin: (origin, callback) => callback(null, true),
+        origin: (origin, callback) => {
+            // Allow Capacitor mobile webview (null/file/capacitor origin) or listed web domains
+            if (!origin || allowedOrigins.includes(origin) || origin.startsWith('capacitor://')) {
+                callback(null, true);
+            } else {
+                callback(new Error('Blocked by CORS'));
+            }
+        },
         credentials: true,
     })
 );
@@ -20,18 +32,25 @@ app.use(
         target: 'https://my.newtonschool.co',
         changeOrigin: true,
         secure: true,
+        proxyTimeout: 10000, // 10s upstream timeout
+        timeout: 10000,
         pathFilter: (pathname) => pathname.startsWith('/api') && pathname !== '/api/send-otp',
         on: {
             proxyReq: (proxyReq, req) => {
                 proxyReq.removeHeader('origin');
                 proxyReq.removeHeader('referer');
-                console.log(`[Proxy Outgoing] ${req.method} ${req.originalUrl}`);
+                console.log(`[Proxy Outgoing] ${req.method} ${req.path}`);
             },
             proxyRes: (proxyRes, req) => {
-                console.log(`[Proxy Response] ${req.method} ${req.originalUrl} -> ${proxyRes.statusCode}`);
+                console.log(`[Proxy Response] ${req.method} ${req.path} -> ${proxyRes.statusCode}`);
             },
-            error: (err, req) => {
-                console.error(`[Proxy Error] ${req.originalUrl}:`, err.message);
+            error: (err, req, res) => {
+                console.error(`[Proxy Error] ${req.path}:`, err.message);
+                if (res && !res.headersSent) {
+                    res.status(502).json({
+                        error: 'Something went wrong connecting to the service. Please try again later.',
+                    });
+                }
             },
         },
     })
@@ -61,9 +80,11 @@ async function initBrowser() {
 async function prepareWarmPage() {
     if (isWarming || !browser) return;
     isWarming = true;
+    let context = null;
+    let page = null;
 
     try {
-        const context = await browser.newContext({
+        context = await browser.newContext({
             userAgent:
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         });
@@ -72,7 +93,8 @@ async function prepareWarmPage() {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
 
-        const page = await context.newPage();
+        page = await context.newPage();
+        page.setDefaultTimeout(15000); // 15s hard ceiling
 
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
@@ -108,8 +130,16 @@ async function prepareWarmPage() {
             { timeout: 10000 }
         );
 
+        // If another warmPage is currently sitting unused, close its context before replacing
+        if (warmPage) {
+            warmPage.context().close().catch(() => { });
+        }
+
         warmPage = page;
-    } catch {
+    } catch (err) {
+        console.error('[WarmPage Error]:', err.message);
+        if (page) await page.close().catch(() => { });
+        if (context) await context.close().catch(() => { });
         warmPage = null;
     } finally {
         isWarming = false;
@@ -136,48 +166,59 @@ app.post('/api/send-otp', express.json(), (req, res) => {
             warmPage = null;
             setTimeout(() => prepareWarmPage(), 100);
 
-            const result = await page.evaluate(
-                async ({ siteKey, phone }) => {
-                    return new Promise((resolve) => {
-                        window.grecaptcha.ready(async () => {
-                            try {
-                                const token = await window.grecaptcha.execute(siteKey, { action: 'login' });
-                                const response = await fetch('/api/v1/user/otp/', {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                        Accept: 'application/json, text/plain, */*',
-                                    },
-                                    body: JSON.stringify({
-                                        phone: `+91${phone}`,
-                                        'g-recaptcha-response': token,
-                                    }),
-                                });
-
-                                const payload = await response.json().catch(() => ({}));
-                                resolve({ ok: response.ok, status: response.status, data: payload });
-                            } catch (err) {
-                                resolve({ ok: false, status: 500, error: err.message });
-                            }
-                        });
-                    });
-                },
-                { siteKey: RECAPTCHA_SITE_KEY, phone: digits }
-            );
-
-            page.context().close().catch(() => { });
-
-            if (!result.ok) {
-                return res.status(result.status || 400).json({
-                    error: result.data?.message || result.data?.detail || 'Portal rejected OTP',
-                });
+            if (!page) {
+                throw new Error('No warm page available');
             }
 
-            res.json({ success: true, message: 'OTP sent successfully' });
+            try {
+                const result = await page.evaluate(
+                    async ({ siteKey, phone }) => {
+                        return new Promise((resolve) => {
+                            window.grecaptcha.ready(async () => {
+                                try {
+                                    const token = await window.grecaptcha.execute(siteKey, { action: 'login' });
+                                    const response = await fetch('/api/v1/user/otp/', {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            Accept: 'application/json, text/plain, */*',
+                                        },
+                                        body: JSON.stringify({
+                                            phone: `+91${phone}`,
+                                            'g-recaptcha-response': token,
+                                        }),
+                                    });
+
+                                    const payload = await response.json().catch(() => ({}));
+                                    resolve({ ok: response.ok, status: response.status, data: payload });
+                                } catch (err) {
+                                    resolve({ ok: false, status: 500, error: err.message });
+                                }
+                            });
+                        });
+                    },
+                    { siteKey: RECAPTCHA_SITE_KEY, phone: digits }
+                );
+
+                if (!result.ok) {
+                    return res.status(result.status || 400).json({
+                        error: result.data?.message || result.data?.detail || 'Portal rejected OTP',
+                    });
+                }
+
+                res.json({ success: true, message: 'OTP sent successfully' });
+            } finally {
+                if (page) {
+                    await page.context().close().catch(() => { });
+                }
+            }
         })
         .catch((err) => {
+            console.error('[Server Error]:', err.message);
             prepareWarmPage().catch(() => { });
-            res.status(500).json({ error: err.message || 'Dispatcher failure' });
+            return res.status(500).json({
+                error: 'Something went wrong. Please try again later.',
+            });
         });
 });
 
