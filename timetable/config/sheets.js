@@ -227,7 +227,7 @@ export const SHEETS_REGISTRY = {
         title: 'SVYASA_Sem_01',
         campus: 's-vyasa',
         sem: '1',
-        url: '',
+        url: 'https://docs.google.com/spreadsheets/d/1N5-MVGIZR2EruBgZ0DSY9ZpR3VhW3OYZ1OCtdXJX7rQ/edit?gid=0#gid=0',
     },
     's-vyasa_2': {
         title: 'SVYASA_Sem_02',
