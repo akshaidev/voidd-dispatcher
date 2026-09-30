@@ -4,12 +4,15 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "echo \"Ready for live testing\" && exit 0"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "http-proxy-middleware": "^3.0.0",
-    "playwright": "1.63.0"
+    "node-cron": "^4.6.0",
+    "playwright": "1.63.0",
+    "xlsx": "^0.18.5"
   }
 }

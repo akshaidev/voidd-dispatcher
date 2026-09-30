@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { chromium } from 'playwright';
 import { createProxyMiddleware } from 'http-proxy-middleware';
+import { timetableRouter, startTimetableCron, getTimetableHealth } from './timetable/index.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -26,7 +27,10 @@ app.use(
     })
 );
 
-// 1. REVERSE PROXY: Catches ALL /api calls (v1, v2, etc.) EXCEPT our local /api/send-otp
+// 1. TIMETABLE SERVICE: Mounted BEFORE reverse proxy to immediately resolve local timetable endpoints
+app.use('/api/timetable', timetableRouter);
+
+// 2. REVERSE PROXY: Catches ALL /api calls (v1, v2, etc.) EXCEPT our local endpoints (/api/send-otp, /api/timetable)
 app.use(
     createProxyMiddleware({
         target: 'https://my.newtonschool.co',
@@ -34,7 +38,10 @@ app.use(
         secure: true,
         proxyTimeout: 10000, // 10s upstream timeout
         timeout: 10000,
-        pathFilter: (pathname) => pathname.startsWith('/api') && pathname !== '/api/send-otp',
+        pathFilter: (pathname) =>
+            pathname.startsWith('/api') &&
+            pathname !== '/api/send-otp' &&
+            !pathname.startsWith('/api/timetable'),
         on: {
             proxyReq: (proxyReq, req) => {
                 proxyReq.removeHeader('origin');
@@ -147,7 +154,11 @@ async function prepareWarmPage() {
 }
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', warm: Boolean(warmPage) });
+    res.json({
+        status: 'ok',
+        warm: Boolean(warmPage),
+        timetable: getTimetableHealth(),
+    });
 });
 
 // 2. OTP DISPATCHER: Apply express.json() specifically to this endpoint
@@ -221,6 +232,8 @@ app.post('/api/send-otp', express.json(), (req, res) => {
             });
         });
 });
+
+startTimetableCron();
 
 initBrowser()
     .then(() => {
